@@ -10,8 +10,7 @@ st.set_page_config(page_title="Transformador de Indicadores WM", page_icon="📊
 
 # --- FUNCIONES DE APOYO ---
 def parse_filters_text(text: str):
-    if not isinstance(text, str):
-        return {}
+    if not isinstance(text, str): return {}
     t = text.replace("\n", " ").replace("\r", " ")
     def m_int(pattern):
         m = re.search(pattern, t, re.I)
@@ -23,40 +22,28 @@ def parse_filters_text(text: str):
     }
 
 def to_number(v):
-    if v is None or v == "" or pd.isna(v):
-        return 0.0
-    if isinstance(v, (int, float)):
-        return float(v)
+    if v is None or v == "" or pd.isna(v): return 0.0
+    if isinstance(v, (int, float)): return float(v)
     s = str(v).strip().replace("$", "").replace("%", "").replace(" ", "").replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except:
-        return 0.0
+    try: return float(s)
+    except: return 0.0
 
 def dia_to_date(day_val, year_val):
-    if pd.isna(day_val) or str(day_val).strip().lower() == "total":
-        return pd.NaT
+    if pd.isna(day_val): return pd.NaT
+    # Limpieza de valores que no son fechas
+    s_val = str(day_val).strip().lower()
+    if s_val in ["dia", "total", "none", ""]: return pd.NaT
+    
     dt = pd.to_datetime(day_val, dayfirst=True, errors="coerce")
+    # Si el año es 1900, aplicar el año detectado en metadatos
     if pd.notna(dt) and year_val and dt.year == 1900:
         try: return dt.replace(year=int(year_val))
         except: return dt
     return dt
 
-def infer_week_label(df):
-    s = pd.to_numeric(df["Semana"], errors="coerce").dropna()
-    if s.empty: return "YY"
-    mn, mx = int(s.min()), int(s.max())
-    return f"{mn:02d}" if mn == mx else f"{mn:02d}-{mx:02d}"
-
-def infer_year_label(df):
-    y = pd.to_numeric(df["Año"], errors="coerce").dropna()
-    if y.empty: return "YYYY"
-    mn, mx = int(y.min()), int(y.max())
-    return str(mn) if mn == mx else f"{mn}-{mx}"
-
 # --- INTERFAZ STREAMLIT ---
 st.title("📊 Transformación de Indicadores WM")
-st.markdown("Sube tu archivo ZIP y obtén los reportes procesados y agrupados.")
+st.markdown("Sube tu archivo ZIP para procesar y agrupar los indicadores correctamente.")
 
 uploaded_file = st.file_uploader("Cargar archivo ZIP con reportes Excel", type="zip")
 
@@ -71,35 +58,45 @@ if uploaded_file is not None:
                 all_files = [f for f in z.namelist() if f.lower().endswith(".xlsx") and "indicadores" in f.lower()]
                 
                 if not all_files:
-                    st.error("No se encontraron archivos válidos dentro del ZIP.")
+                    st.error("No se encontraron archivos válidos.")
                 else:
                     progress_bar = st.progress(0)
                     for i, fn in enumerate(all_files):
                         with z.open(fn) as f:
                             content = f.read()
-                            # 1. Metadatos con Openpyxl
+                            # 1. Leer Metadatos
                             meta_wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
                             ws = meta_wb["Export"] if "Export" in meta_wb.sheetnames else meta_wb.worksheets[0]
                             meta = {}
-                            for r in range(1, 100):
+                            for r in range(1, 50):
                                 v = ws.cell(r, 1).value
-                                if isinstance(v, str) and v.strip().lower().startswith("filtros aplicados:"):
+                                if isinstance(v, str) and "filtros aplicados:" in v.lower():
                                     meta = parse_filters_text(v)
                                     break
                             meta_wb.close()
                             
-                            # 2. Transformar con Pandas
-                            df = pd.read_excel(io.BytesIO(content), sheet_name="Export", header=0)
+                            # 2. Cargar con Pandas buscando la tabla real
+                            df_raw = pd.read_excel(io.BytesIO(content), header=None)
                             
-                            # Forzamos los nombres de las primeras 4 columnas por posición (Blindaje)
+                            # Buscar la fila donde realmente empiezan los datos (evita filas extras)
+                            start_idx = 0
+                            for idx, row in df_raw.iterrows():
+                                if any(str(val).strip().lower() == "kpi" for val in row):
+                                    start_idx = idx + 1
+                                    break
+                            
+                            # Re-leer desde la fila detectada
+                            df = pd.read_excel(io.BytesIO(content), skiprows=start_idx)
+                            
+                            # Forzar nombres por posición para evitar errores de nombres
                             df.columns.values[0] = "Año"
                             df.columns.values[1] = "Mes"
                             df.columns.values[2] = "Semana"
                             df.columns.values[3] = "Dia"
                             
-                            # Limpieza de filas de "Total" y vacías
+                            # LIMPIEZA CRÍTICA: Eliminar filas de texto extra o totales
                             df = df[df["Dia"].notna()].copy()
-                            df = df[~df["Dia"].astype(str).str.lower().str.contains("total", na=False)]
+                            df = df[~df["Dia"].astype(str).str.lower().str.contains("total|dia|mes|semana", na=False)]
                             
                             # Procesar Año y Local ID
                             anio_meta = meta.get("Año", 2026)
@@ -107,55 +104,51 @@ if uploaded_file is not None:
                             local_id = meta.get("Local ID", "Desconocido")
                             df.insert(0, "Local ID", local_id)
                             
-                            # PROCESAR FECHAS (DIA) - Usamos apply para pasar el año de la fila
+                            # PROCESAR FECHAS (DIA)
                             df["Dia"] = df.apply(lambda row: dia_to_date(row["Dia"], row["Año"]), axis=1)
                             
-                            # Convertir resto de columnas a número
+                            # Asegurar que no queden filas sin fecha válida
+                            df = df[df["Dia"].notna()].copy()
+
+                            # Convertir indicadores a números
                             for c in df.columns:
                                 if c not in ["Local ID", "Año", "Mes", "Semana", "Dia"]:
                                     df[c] = df[c].apply(to_number)
+                                    if c in PERCENT_COLS and df[c].gt(1).any():
+                                        df[c] = df[c] / 100.0
                             
-                            # Asegurar que existan todas las columnas del esquema
+                            # Garantizar el esquema final
                             for c in FINAL_SCHEMA:
                                 if c not in df.columns: df[c] = 0.0
                             
-                            # Normalizar porcentajes
-                            for c in PERCENT_COLS:
-                                if df[c].gt(1).any(): df[c] = df[c] / 100.0
+                            df_final = df[FINAL_SCHEMA].copy()
                             
-                            df = df[FINAL_SCHEMA].copy()
-                            
-                            # Agrupar
-                            week_label = infer_week_label(df)
-                            year_label = infer_year_label(df)
-                            key = (str(local_id), year_label, week_label)
+                            # Agrupar por Local y Semana (usando etiquetas de metadatos)
+                            key = (str(local_id), str(anio_meta), str(meta.get("Semana", "XX")))
                             
                             if key not in by_key:
-                                by_key[key] = df
+                                by_key[key] = df_final
                             else:
-                                by_key[key] = pd.concat([by_key[key], df], ignore_index=True).drop_duplicates(subset=["Dia", "Local ID"])
+                                by_key[key] = pd.concat([by_key[key], df_final]).drop_duplicates(subset=["Dia", "Local ID"])
                         
                         progress_bar.progress((i + 1) / len(all_files))
 
-            # --- GENERAR ZIP DE SALIDA ---
+            # --- GENERAR ZIP ---
             if by_key:
-                output_zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(output_zip_buffer, "w", zipfile.ZIP_DEFLATED) as new_zip:
-                    for (loc, yr, wk), final_df in by_key.items():
+                out_zip = io.BytesIO()
+                with zipfile.ZipFile(out_zip, "w") as new_z:
+                    for (loc, yr, wk), fdf in by_key.items():
                         excel_buf = io.BytesIO()
                         with pd.ExcelWriter(excel_buf, engine='openpyxl', datetime_format="DD/MM/YYYY") as writer:
-                            final_df.to_excel(writer, index=False, sheet_name="Datos")
-                        new_zip.writestr(f"Local{loc}_Año{yr}_Semanas{wk}.xlsx", excel_buf.getvalue())
+                            fdf.to_excel(writer, index=False)
+                        new_z.writestr(f"Local_{loc}_Año{yr}_S{wk}.xlsx", excel_buf.getvalue())
                 
-                st.success(f"✅ ¡Hecho! Se procesaron {len(by_key)} grupos de locales.")
-                st.download_button(
-                    label="📥 Descargar Resultados (ZIP)",
-                    data=output_zip_buffer.getvalue(),
-                    file_name="Reportes_Procesados_WM.zip",
-                    mime="application/zip"
-                )
-                # Vista previa para confirmar que "Dia" tiene datos
-                st.subheader("Vista previa del último proceso:")
-                st.dataframe(df.head(5))
+                st.success(f"✅ Procesados {len(by_key)} grupos de datos.")
+                st.download_button("📥 Descargar Resultados", out_zip.getvalue(), "Reportes_WM.zip", "application/zip")
+                
+                st.subheader("Vista previa del proceso (sin filas extra):")
+                st.dataframe(df_final.head(10)) # Aquí verás que el 'Dia' ahora tiene fecha
+            else:
+                st.warning("No se encontraron datos válidos.")
         except Exception as e:
-            st.error(f"Se produjo un error durante el proceso: {e}")
+            st.error(f"❌ Error: {e}")
