@@ -32,6 +32,7 @@ def dia_to_date(day_val, year_val):
     if pd.isna(day_val): return pd.NaT
     s_val = str(day_val).strip().lower()
     if s_val in ["dia", "total", "none", "", "mes", "semana del año"]: return pd.NaT
+    
     dt = pd.to_datetime(day_val, dayfirst=True, errors="coerce")
     if pd.notna(dt) and year_val and dt.year == 1900:
         try: return dt.replace(year=int(year_val))
@@ -57,70 +58,75 @@ if uploaded_file is not None:
                 else:
                     progress_bar = st.progress(0)
                     for i, fn in enumerate(all_files):
-                        with z.open(fn) as f:
-                            content = f.read()
-                            # 1. Metadatos
-                            meta_wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
-                            ws = meta_wb.active
-                            meta = {}
-                            for r in range(1, 40):
-                                v = ws.cell(r, 1).value
-                                if v and "filtros aplicados:" in str(v).lower():
-                                    meta = parse_filters_text(str(v))
-                                    break
-                            meta_wb.close()
+                        try:
+                            with z.open(fn) as f:
+                                content = f.read()
+                                # 1. Metadatos
+                                meta_wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+                                ws = meta_wb.active
+                                meta = {}
+                                for r in range(1, 40):
+                                    v = ws.cell(r, 1).value
+                                    if v and "filtros aplicados:" in str(v).lower():
+                                        meta = parse_filters_text(str(v))
+                                        break
+                                meta_wb.close()
 
-                            # 2. Localizar tabla
-                            df_raw = pd.read_excel(io.BytesIO(content), header=None)
-                            start_idx = 0
-                            found = False
-                            for idx, row in df_raw.iterrows():
-                                row_str = " ".join(row.astype(str).lower())
-                                if any(word in row_str for word in ["kpi", "año", "pedidos"]):
-                                    start_idx = idx + 1
-                                    found = True
-                                    break
-                            
-                            actual_start = start_idx if found else 7
-                            df = pd.read_excel(io.BytesIO(content), skiprows=actual_start)
-                            
-                            # --- VALIDACIÓN ANTICHOQUE ---
-                            if df.empty or len(df.columns) < 4:
-                                continue # Salta este archivo si no tiene columnas suficientes
+                                # 2. Localizar tabla de forma dinámica
+                                df_raw = pd.read_excel(io.BytesIO(content), header=None)
+                                start_idx = 0
+                                found = False
+                                for idx, row in df_raw.iterrows():
+                                    row_str = " ".join(row.astype(str).lower())
+                                    if any(word in row_str for word in ["kpi", "año", "pedidos"]):
+                                        start_idx = idx + 1
+                                        found = True
+                                        break
+                                
+                                actual_start = start_idx if found else 7
+                                df = pd.read_excel(io.BytesIO(content), skiprows=actual_start)
+                                
+                                # Validación de seguridad: evitar 'IndexError'
+                                if df.empty or len(df.columns) < 4:
+                                    continue
 
-                            # Forzar nombres de forma segura
-                            new_cols = list(df.columns)
-                            new_cols[0], new_cols[1], new_cols[2], new_cols[3] = "Año_O", "Mes", "Semana", "Dia"
-                            df.columns = new_cols
-                            
-                            # Limpieza
-                            df = df[df["Dia"].notna()].copy()
-                            df = df[~df["Dia"].astype(str).str.lower().str.contains("total|dia|mes|semana", na=False)]
+                                # Forzar nombres de columnas por posición
+                                temp_cols = list(df.columns)
+                                temp_cols[0], temp_cols[1], temp_cols[2], temp_cols[3] = "Año_O", "Mes", "Semana", "Dia"
+                                df.columns = temp_cols
+                                
+                                # Limpieza de filas basura
+                                df = df[df["Dia"].notna()].copy()
+                                df = df[~df["Dia"].astype(str).str.lower().str.contains("total|dia|mes|semana", na=False)]
 
-                            anio_meta = meta.get("Año", 2026)
-                            l_id = meta.get("Local ID", "ID_Faltante")
-                            
-                            df.insert(0, "Local ID", l_id)
-                            df["Año"] = anio_meta
-                            df["Dia"] = df.apply(lambda row: dia_to_date(row["Dia"], row["Año"]), axis=1)
-                            df = df[df["Dia"].notna()].copy()
+                                anio_meta = meta.get("Año", 2026)
+                                l_id = meta.get("Local ID", "ID_Faltante")
+                                
+                                df.insert(0, "Local ID", l_id)
+                                df["Año"] = anio_meta
+                                df["Dia"] = df.apply(lambda row: dia_to_date(row["Dia"], row["Año"]), axis=1)
+                                
+                                # Solo conservar si la fecha es válida
+                                df = df[df["Dia"].notna()].copy()
 
-                            for col in df.columns:
-                                if col not in ["Local ID", "Año", "Mes", "Semana", "Dia"]:
-                                    df[col] = df[col].apply(to_number)
-                                    if col in PERCENT_COLS and df[col].gt(1).any():
-                                        df[col] = df[col] / 100.0
-                            
-                            for col in FINAL_SCHEMA:
-                                if col not in df.columns: df[col] = 0.0
+                                for col in df.columns:
+                                    if col not in ["Local ID", "Año", "Mes", "Semana", "Dia"]:
+                                        df[col] = df[col].apply(to_number)
+                                        if col in PERCENT_COLS and df[col].gt(1).any():
+                                            df[col] = df[col] / 100.0
+                                
+                                for col in FINAL_SCHEMA:
+                                    if col not in df.columns: df[col] = 0.0
 
-                            df_final = df[FINAL_SCHEMA].copy()
-                            
-                            key = (str(l_id), str(meta.get("Semana", "XX")))
-                            if key not in by_key:
-                                by_key[key] = df_final
-                            else:
-                                by_key[key] = pd.concat([by_key[key], df_final]).drop_duplicates(subset=["Dia"])
+                                df_final = df[FINAL_SCHEMA].copy()
+                                
+                                key = (str(l_id), str(meta.get("Semana", "XX")))
+                                if key not in by_key:
+                                    by_key[key] = df_final
+                                else:
+                                    by_key[key] = pd.concat([by_key[key], df_final]).drop_duplicates(subset=["Dia"])
+                        except:
+                            continue # Si un archivo falla, seguir con el siguiente
                         
                         progress_bar.progress((i + 1) / len(all_files))
 
@@ -133,11 +139,12 @@ if uploaded_file is not None:
                             fdf.to_excel(writer, index=False)
                         new_z.writestr(f"Local_{loc}_Semana_{sem}.xlsx", excel_buf.getvalue())
                 
-                st.success(f"✅ Procesados {len(by_key)} locales.")
+                st.success(f"✅ Procesados {len(by_key)} locales con éxito.")
                 st.download_button("📥 Descargar Resultados", out_buf.getvalue(), "Reportes_WM.zip", "application/zip")
                 st.dataframe(df_final.head(10)) 
             else:
-                st.warning("⚠️ No se detectaron tablas de datos válidas en los archivos subidos.")
+                st.warning("⚠️ No se encontraron tablas de datos válidas.")
 
         except Exception as e:
-            st.error(f"❌ Error crítico: {e}")
+            st.error(f"❌ Error general: {e}")
+
