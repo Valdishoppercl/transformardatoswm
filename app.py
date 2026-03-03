@@ -31,11 +31,9 @@ def to_number(v):
 def dia_to_date(day_val, year_val):
     if pd.isna(day_val): return pd.NaT
     s_val = str(day_val).strip().lower()
-    # Filtrar valores que no son fechas
     if s_val in ["dia", "total", "none", "", "mes", "semana del año"]: return pd.NaT
     
     dt = pd.to_datetime(day_val, dayfirst=True, errors="coerce")
-    # Ajustar año si Excel lo detecta como 1900
     if pd.notna(dt) and year_val and dt.year == 1900:
         try: return dt.replace(year=int(year_val))
         except: return dt
@@ -55,9 +53,9 @@ def infer_year_label(df):
 
 # --- INTERFAZ STREAMLIT ---
 st.title("📊 Transformación de Indicadores WM")
-st.markdown("Sube tu archivo ZIP con los reportes originales.")
+st.markdown("Sube tu archivo ZIP para procesar y agrupar los indicadores correctamente.")
 
-uploaded_file = st.file_uploader("Cargar archivo ZIP", type="zip")
+uploaded_file = st.file_uploader("Cargar archivo ZIP con reportes Excel", type="zip")
 
 if uploaded_file is not None:
     if st.button("🚀 Iniciar Transformación"):
@@ -76,61 +74,65 @@ if uploaded_file is not None:
                     for i, fn in enumerate(all_files):
                         with z.open(fn) as f:
                             content = f.read()
-                            # 1. Metadatos (ID, Semana, Año)
+                            # 1. Metadatos (ID Local, Semana, Año)
                             meta_wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
                             ws = meta_wb["Export"] if "Export" in meta_wb.sheetnames else meta_wb.worksheets[0]
                             meta = {}
-                            for r in range(1, 100):
+                            for r in range(1, 50):
                                 v = ws.cell(r, 1).value
                                 if isinstance(v, str) and "filtros aplicados:" in v.lower():
                                     meta = parse_filters_text(v)
                                     break
                             meta_wb.close()
                             
-                            # 2. Localizar inicio real de tabla
-                            df_raw = pd.read_excel(io.BytesIO(content), header=None)
+                            # 2. DETECCIÓN DINÁMICA DE TABLA (Esto evita archivos vacíos)
+                            df_check = pd.read_excel(io.BytesIO(content), header=None)
                             start_idx = 0
-                            for idx, row in df_raw.iterrows():
-                                if any(str(val).strip().lower() == "kpi" for val in row):
+                            for idx, row in df_check.iterrows():
+                                # Buscamos la fila que contiene los encabezados reales
+                                row_str = " ".join(row.astype(str).lower())
+                                if "kpi" in row_str or "año" in row_str:
                                     start_idx = idx + 1
                                     break
                             
+                            # 3. Carga limpia saltando la basura superior
                             df = pd.read_excel(io.BytesIO(content), skiprows=start_idx)
                             if df.empty: continue
 
-                            # 3. Forzar nombres de columnas
+                            # Forzar nombres por posición (blindaje contra nombres con tildes)
                             df.columns.values[0] = "Año_O"
                             df.columns.values[1] = "Mes"
                             df.columns.values[2] = "Semana"
                             df.columns.values[3] = "Dia"
                             
-                            # Limpiar filas extra
+                            # Limpieza de filas de texto extra o totales
                             df = df[df["Dia"].notna()].copy()
                             df = df[~df["Dia"].astype(str).str.lower().str.contains("total|dia|mes|semana", na=False)]
                             
-                            # Asignar Local ID y Año desde filtros
+                            # Asignar Local ID y Año desde metadatos
                             anio_meta = meta.get("Año", 2026)
-                            local_id = meta.get("Local ID", "ID_Faltante")
+                            local_id = meta.get("Local ID", "Desconocido")
                             df.insert(0, "Local ID", local_id)
                             df["Año"] = anio_meta
                             
-                            # PROCESAR FECHAS
+                            # PROCESAR FECHAS (DIA)
                             df["Dia"] = df.apply(lambda row: dia_to_date(row["Dia"], row["Año"]), axis=1)
                             df = df[df["Dia"].notna()].copy()
 
-                            # Limpiar indicadores numéricos
+                            # Convertir indicadores y limpiar porcentajes
                             for c in df.columns:
                                 if c not in ["Local ID", "Año", "Mes", "Semana", "Dia"]:
                                     df[c] = df[c].apply(to_number)
                                     if c in PERCENT_COLS and df[c].gt(1).any():
                                         df[c] = df[c] / 100.0
                             
+                            # Garantizar el esquema final
                             for c in FINAL_SCHEMA:
                                 if c not in df.columns: df[c] = 0.0
                             
                             df_final = df[FINAL_SCHEMA].copy()
                             
-                            # Agrupar por Local/Semana
+                            # Agrupar por Local y Semana
                             week_label = infer_week_label(df_final)
                             year_label = infer_year_label(df_final)
                             key = (str(local_id), year_label, week_label)
@@ -142,6 +144,7 @@ if uploaded_file is not None:
                         
                         progress_bar.progress((i + 1) / len(all_files))
 
+            # --- GENERAR SALIDA ---
             if by_key:
                 out_zip = io.BytesIO()
                 with zipfile.ZipFile(out_zip, "w") as new_z:
@@ -151,10 +154,10 @@ if uploaded_file is not None:
                             fdf.to_excel(writer, index=False)
                         new_z.writestr(f"Local_{loc}_Año{yr}_S{wk}.xlsx", excel_buf.getvalue())
                 
-                st.success(f"✅ Procesados {len(by_key)} grupos de datos.")
+                st.success(f"✅ Procesados {len(by_key)} locales con éxito.")
                 st.download_button("📥 Descargar Resultados", out_zip.getvalue(), "Reportes_WM.zip", "application/zip")
                 st.dataframe(df_final.head(10)) 
             else:
-                st.warning("No se encontraron datos.")
+                st.warning("No se encontraron datos válidos.")
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"❌ Error crítico: {e}")
