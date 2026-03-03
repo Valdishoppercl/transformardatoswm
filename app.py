@@ -143,7 +143,7 @@ if uploaded_file is not None:
                         excel_buf = io.BytesIO()
                         with pd.ExcelWriter(excel_buf, engine='openpyxl', datetime_format="DD/MM/YYYY") as writer:
                             fdf.to_excel(writer, index=False)
-                        new_z.writestr(f"Local_{loc}_Año{yr}_S{wk}.xlsx", excel_buf.getvalue())
+                        new_z.writestr(f"Local{loc}_Año{yr}_Semanas{wk}.xlsx", excel_buf.getvalue())
                 
                 st.success(f"✅ Procesados {len(by_key)} locales con datos.")
                 st.download_button("📥 Descargar Resultados", out_zip.getvalue(), "Reportes_WM.zip", "application/zip")
@@ -152,3 +152,4 @@ if uploaded_file is not None:
                 st.warning("No se encontraron tablas de datos válidas.")
         except Exception as e:
             st.error(f"❌ Error crítico: {e}")
+
