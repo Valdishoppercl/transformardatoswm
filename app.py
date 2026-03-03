@@ -32,7 +32,6 @@ def dia_to_date(day_val, year_val):
     if pd.isna(day_val): return pd.NaT
     s_val = str(day_val).strip().lower()
     if s_val in ["dia", "total", "none", "", "mes", "semana del año"]: return pd.NaT
-    
     dt = pd.to_datetime(day_val, dayfirst=True, errors="coerce")
     if pd.notna(dt) and year_val and dt.year == 1900:
         try: return dt.replace(year=int(year_val))
@@ -71,7 +70,7 @@ if uploaded_file is not None:
                                     break
                             meta_wb.close()
 
-                            # 2. Localizar tabla (Búsqueda flexible)
+                            # 2. Localizar tabla
                             df_raw = pd.read_excel(io.BytesIO(content), header=None)
                             start_idx = 0
                             found = False
@@ -82,31 +81,30 @@ if uploaded_file is not None:
                                     found = True
                                     break
                             
-                            # Si no encontró el texto, intentar una fila por defecto (usualmente la 7 u 8 en estos reportes)
                             actual_start = start_idx if found else 7
                             df = pd.read_excel(io.BytesIO(content), skiprows=actual_start)
                             
-                            if df.empty: continue
+                            # --- VALIDACIÓN ANTICHOQUE ---
+                            if df.empty or len(df.columns) < 4:
+                                continue # Salta este archivo si no tiene columnas suficientes
 
-                            # Forzar nombres
-                            df.columns.values[0:4] = ["Año_O", "Mes", "Semana", "Dia"]
+                            # Forzar nombres de forma segura
+                            new_cols = list(df.columns)
+                            new_cols[0], new_cols[1], new_cols[2], new_cols[3] = "Año_O", "Mes", "Semana", "Dia"
+                            df.columns = new_cols
                             
-                            # Limpieza de filas
-                            df = df[df[df.columns[3]].notna()].copy()
-                            df = df[~df[df.columns[3]].astype(str).str.lower().str.contains("total|dia|mes|semana", na=False)]
+                            # Limpieza
+                            df = df[df["Dia"].notna()].copy()
+                            df = df[~df["Dia"].astype(str).str.lower().str.contains("total|dia|mes|semana", na=False)]
 
-                            # Metadatos base
                             anio_meta = meta.get("Año", 2026)
                             l_id = meta.get("Local ID", "ID_Faltante")
                             
                             df.insert(0, "Local ID", l_id)
                             df["Año"] = anio_meta
-                            
-                            # Procesar Fecha
                             df["Dia"] = df.apply(lambda row: dia_to_date(row["Dia"], row["Año"]), axis=1)
                             df = df[df["Dia"].notna()].copy()
 
-                            # Números e Indicadores
                             for col in df.columns:
                                 if col not in ["Local ID", "Año", "Mes", "Semana", "Dia"]:
                                     df[col] = df[col].apply(to_number)
@@ -118,7 +116,6 @@ if uploaded_file is not None:
 
                             df_final = df[FINAL_SCHEMA].copy()
                             
-                            # Agrupar
                             key = (str(l_id), str(meta.get("Semana", "XX")))
                             if key not in by_key:
                                 by_key[key] = df_final
@@ -136,11 +133,11 @@ if uploaded_file is not None:
                             fdf.to_excel(writer, index=False)
                         new_z.writestr(f"Local_{loc}_Semana_{sem}.xlsx", excel_buf.getvalue())
                 
-                st.success(f"✅ Procesados {len(by_key)} locales con datos.")
+                st.success(f"✅ Procesados {len(by_key)} locales.")
                 st.download_button("📥 Descargar Resultados", out_buf.getvalue(), "Reportes_WM.zip", "application/zip")
                 st.dataframe(df_final.head(10)) 
             else:
-                st.warning("⚠️ El sistema no detectó la tabla de datos. Asegúrate de que los Excel tengan la estructura estándar.")
+                st.warning("⚠️ No se detectaron tablas de datos válidas en los archivos subidos.")
 
         except Exception as e:
             st.error(f"❌ Error crítico: {e}")
