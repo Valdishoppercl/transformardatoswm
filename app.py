@@ -31,25 +31,27 @@ def to_number(v):
 def dia_to_date(day_val, year_val):
     if pd.isna(day_val): return pd.NaT
     s_val = str(day_val).strip().lower()
+    # Filtro de palabras que no son fechas
     if s_val in ["dia", "total", "none", "", "mes", "semana del año"]: return pd.NaT
     
+    # Intento 1: Conversión directa de fecha
     dt = pd.to_datetime(day_val, dayfirst=True, errors="coerce")
+    
+    # Intento 2: Si es un número (ej. "1"), lo unimos con el año (asumiendo que pd.to_datetime lo maneja con el mes actual o lo fijamos)
+    if pd.isna(dt):
+        try:
+            # Si el valor es un número entero (día del mes)
+            day_num = int(float(day_val))
+            if 1 <= day_num <= 31:
+                # Intentamos construir una fecha mínima para que pd.to_datetime lo procese
+                dt = pd.to_datetime(f"{day_num}/01/{int(year_val)}", dayfirst=True, errors='coerce')
+        except: pass
+
+    # Si el año detectado es 1900, forzamos el año de los filtros
     if pd.notna(dt) and year_val and dt.year == 1900:
         try: return dt.replace(year=int(year_val))
         except: return dt
     return dt
-
-def infer_week_label(df):
-    s = pd.to_numeric(df["Semana"], errors="coerce").dropna()
-    if s.empty: return "YY"
-    mn, mx = int(s.min()), int(s.max())
-    return f"{mn:02d}" if mn == mx else f"{mn:02d}-{mx:02d}"
-
-def infer_year_label(df):
-    y = pd.to_numeric(df["Año"], errors="coerce").dropna()
-    if y.empty: return "YYYY"
-    mn, mx = int(y.min()), int(y.max())
-    return str(mn) if mn == mx else f"{mn}-{mx}"
 
 # --- INTERFAZ STREAMLIT ---
 st.title("📊 Transformación de Indicadores WM")
@@ -65,10 +67,10 @@ if uploaded_file is not None:
             FINAL_SCHEMA = ["Local ID","Año","Mes","Semana","Dia","Pedidos Facturados"] + PERCENT_COLS
             
             with zipfile.ZipFile(uploaded_file, 'r') as z:
-                all_files = [f for f in z.namelist() if f.lower().endswith(".xlsx") and "indicadores" in f.lower()]
+                all_files = [fn for fn in z.namelist() if fn.lower().endswith(".xlsx") and "indicadores" in fn.lower()]
                 
                 if not all_files:
-                    st.error("No se encontraron archivos válidos.")
+                    st.error("No se encontraron archivos válidos dentro del ZIP.")
                 else:
                     progress_bar = st.progress(0)
                     for i, fn in enumerate(all_files):
@@ -85,27 +87,27 @@ if uploaded_file is not None:
                                     break
                             meta_wb.close()
                             
-                            # 2. DETECCIÓN DINÁMICA DE TABLA (Esto evita archivos vacíos)
-                            df_check = pd.read_excel(io.BytesIO(content), header=None)
-                            start_idx = 0
-                            for idx, row in df_check.iterrows():
-                                # Buscamos la fila que contiene los encabezados reales
-                                row_str = " ".join(row.astype(str).lower())
-                                if "kpi" in row_str or "año" in row_str:
-                                    start_idx = idx + 1
+                            # 2. DETECCIÓN DINÁMICA DE TABLA (Solución al error 'Series')
+                            df_raw = pd.read_excel(io.BytesIO(content), header=None)
+                            header_idx = 0
+                            for idx, row in df_raw.iterrows():
+                                # Unimos la fila en un solo texto para buscar las palabras clave
+                                row_text = " ".join(row.dropna().astype(str)).lower()
+                                if "kpi" in row_text or "año" in row_text:
+                                    header_idx = idx
                                     break
                             
-                            # 3. Carga limpia saltando la basura superior
-                            df = pd.read_excel(io.BytesIO(content), skiprows=start_idx)
+                            # 3. Lectura real desde la fila detectada
+                            df = pd.read_excel(io.BytesIO(content), skiprows=header_idx)
                             if df.empty: continue
 
-                            # Forzar nombres por posición (blindaje contra nombres con tildes)
-                            df.columns.values[0] = "Año_O"
+                            # Forzamos nombres de columnas por posición (Blindaje)
+                            df.columns.values[0] = "Año_Orig"
                             df.columns.values[1] = "Mes"
                             df.columns.values[2] = "Semana"
                             df.columns.values[3] = "Dia"
                             
-                            # Limpieza de filas de texto extra o totales
+                            # Limpieza de basura (Filas de Total o encabezados repetidos)
                             df = df[df["Dia"].notna()].copy()
                             df = df[~df["Dia"].astype(str).str.lower().str.contains("total|dia|mes|semana", na=False)]
                             
@@ -117,25 +119,25 @@ if uploaded_file is not None:
                             
                             # PROCESAR FECHAS (DIA)
                             df["Dia"] = df.apply(lambda row: dia_to_date(row["Dia"], row["Año"]), axis=1)
+                            
+                            # Eliminar filas donde la fecha falló (limpieza final)
                             df = df[df["Dia"].notna()].copy()
 
-                            # Convertir indicadores y limpiar porcentajes
+                            # Convertir indicadores y limpiar formatos
                             for c in df.columns:
                                 if c not in ["Local ID", "Año", "Mes", "Semana", "Dia"]:
                                     df[c] = df[c].apply(to_number)
                                     if c in PERCENT_COLS and df[c].gt(1).any():
                                         df[c] = df[c] / 100.0
                             
-                            # Garantizar el esquema final
+                            # Asegurar el esquema final
                             for c in FINAL_SCHEMA:
                                 if c not in df.columns: df[c] = 0.0
                             
                             df_final = df[FINAL_SCHEMA].copy()
                             
-                            # Agrupar por Local y Semana
-                            week_label = infer_week_label(df_final)
-                            year_label = infer_year_label(df_final)
-                            key = (str(local_id), year_label, week_label)
+                            # Clave para agrupar: Local + Año + Semana
+                            key = (str(local_id), str(int(anio_meta)), str(meta.get("Semana", "XX")))
                             
                             if key not in by_key:
                                 by_key[key] = df_final
@@ -144,7 +146,7 @@ if uploaded_file is not None:
                         
                         progress_bar.progress((i + 1) / len(all_files))
 
-            # --- GENERAR SALIDA ---
+            # --- GENERACIÓN DE SALIDA ---
             if by_key:
                 out_zip = io.BytesIO()
                 with zipfile.ZipFile(out_zip, "w") as new_z:
